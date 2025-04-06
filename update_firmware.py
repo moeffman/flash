@@ -74,7 +74,10 @@ def open_serial(port, baudrate=115200):
 
 def get_port():
     port_index = 0
-    screen_killed = False
+    screen_killed = {}
+    for port in PORTS:
+        screen_killed[port] = False
+
     available_ports = []
     port = None
 
@@ -85,8 +88,8 @@ def get_port():
                 port = PORTS[port_index]
                 port_index += 1
         except serial.SerialException as e:
-            if e.errno == 16 and not screen_killed:
-                screen_killed = True
+            if e.errno == 16 and not screen_killed[PORTS[port_index]]:
+                screen_killed[PORTS[port_index]] = True
                 kill_screen_on_uart(PORTS[port_index])
             elif e.errno == 2 and port_index < len(PORTS)-1:
                 port_index += 1
@@ -133,12 +136,19 @@ def send_firmware():
     state = State.HANDSHAKE
     firmware_data = read_binary()
 
-    # Sends a command to the application, making it jump to bootloader
     with open_serial(port, BAUDRATE_APP) as ser:
+
         # TODO: Test different baud rates here before sending flash command
         # Maybe can just send the flash command with different bauds and
         # see if one responds
-        ser.write(b"\rflash\r")
+
+        # Sending a return to clear any commands not parsed by the application
+        ser.write(b"\r")
+        time.sleep(0.1)
+        ser.reset_input_buffer()
+        # Sends a flash command to the application,
+        # making it jump to bootloader
+        ser.write(b"flash\r")
 
     # Attempting to flash
     with open_serial(port, BAUDRATE_BL) as ser:
@@ -165,9 +175,11 @@ def send_firmware():
                     # TODO: Try to send "1234" with different baud rates
                     # If response is also "1234" baud is matching, can proceed
                     ser.write(b"U")
+                    ser.reset_input_buffer()
                     msg = read_message(ser, 0)
                     if msg and "ACK" in msg:
                         ser.write(b"A")
+                        ser.reset_input_buffer()
                         msg = read_message(ser, 3)
                         if msg and "ACK" in msg:
                             print("Handshake completed, sending size..")
@@ -175,6 +187,7 @@ def send_firmware():
 
                 case State.SIZE:
                     ser.write(bytearray(firmware_size_bytes))
+                    ser.reset_input_buffer()
                     msg = read_message(ser, len(str(len(firmware_data))))
                     if msg and str(len(firmware_data)) in msg:
                         state = State.FILE
@@ -183,6 +196,12 @@ def send_firmware():
                         return
                     else:
                         time.sleep(0.1)
+
+                # TODO: Require ACK for each chunk
+                # make it retry after a small delay
+                #
+                # bootloader also needs to reset if no data is received
+                # within an acceptable time frame
 
                 case State.FILE:
                     for i in range(0, len(firmware_data), chunk_size):
