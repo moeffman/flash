@@ -61,53 +61,87 @@ def read_message(ser, size, blocking=False):
     return None
 
 
-def open_serial(baudrate):
-    port_index = 0
-    screen_killed = False
+def open_serial(port, baudrate=115200):
+
     while True:
         try:
-            with serial.Serial(PORTS[port_index], baudrate) as ser:
+            with serial.Serial(port, baudrate) as ser:
                 return ser
+        except serial.SerialException as e:
+            print(e)
+            exit(1)
+
+
+def get_port():
+    port_index = 0
+    screen_killed = False
+    available_ports = []
+    port = None
+
+    while True:
+        try:
+            with serial.Serial(PORTS[port_index]):
+                available_ports.append(PORTS[port_index])
+                port = PORTS[port_index]
+                port_index += 1
         except serial.SerialException as e:
             if e.errno == 16 and not screen_killed:
                 screen_killed = True
                 kill_screen_on_uart(PORTS[port_index])
             elif e.errno == 2 and port_index < len(PORTS)-1:
-                port_index = port_index + 1
-            else:
-                if e.errno == 2:
-                    print(
-                        f"[Errno {e.errno}] could not open port: "
-                        + "No such file or directory")
-                else:
-                    print(e)
+                port_index += 1
+            elif e.errno == 2 and len(available_ports) == 0:
+                print(f"[Errno {e.errno}] could not find a valid port")
                 exit(1)
 
+        if port_index == len(PORTS)-1:
+            break
 
-def send_firmware():
+    # TODO: Allow for multiple units to get flashed?
+    if len(available_ports) > 1:
+        print("Multiple connections found:")
+        for i in range(1, len(available_ports)+1):
+            print(f"{i}: {available_ports[i-1]}")
 
+        ans = None
+        while ans is None:
+            ans = input("\nWhat port do you want to use?\n> ")
+            if ans.isdigit() and 1 <= int(ans) <= len(available_ports):
+                port = available_ports[int(ans)-1]
+            else:
+                ans = None
+                print("\nInvalid choice, these connections where found:\n")
+                for i in range(1, len(available_ports)+1):
+                    print(f"{i}: {available_ports[i-1]}")
+
+    return port
+
+
+def read_binary():
     try:
         with open(FIRMWARE_FILE, "rb") as f:
-            firmware_data = f.read()
+            return f.read()
     except FileNotFoundError:
         print("Error: Firmware file not found!")
         sys.exit(1)
 
+
+def send_firmware():
+
+    port = get_port()
+
     state = State.HANDSHAKE
+    firmware_data = read_binary()
 
-    # TODO: Before actually sending the flash message and proceeding,
-    # check if more than one device is connected, and let the user
-    # choose what device to flash to
-
-    # Sends a command to the application, sending it to bootloader
-    with open_serial(BAUDRATE_APP) as ser:
+    # Sends a command to the application, making it jump to bootloader
+    with open_serial(port, BAUDRATE_APP) as ser:
         # TODO: Test different baud rates here before sending flash command
         # Maybe can just send the flash command with different bauds and
         # see if one responds
         ser.write(b"\rflash\r")
 
     # Attempting to flash
-    with open_serial(BAUDRATE_BL) as ser:
+    with open_serial(port, BAUDRATE_BL) as ser:
         print()
         print("///////////////////////////////////////////////////")
         print(f"// Firmware file: {sys.argv[1]}")
@@ -122,10 +156,7 @@ def send_firmware():
         crc = zlib.crc32(firmware_data) & 0xFFFFFFFF
         crc_bytes = struct.pack(">I", crc)
 
-        for i in range(1, 1000):
-            ser.timeout = 0
-            if not ser.readline():
-                break
+        ser.reset_input_buffer()
 
         while True:
             time.sleep(0.1)
