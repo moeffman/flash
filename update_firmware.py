@@ -1,32 +1,184 @@
 import sys
 import os
 import serial
+import serial_asyncio
+import asyncio
 import struct
 import zlib
-import time
 import subprocess
-import enum
+import time
+import random
 
 # Configuration
 PORTS = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2", "/dev/ttyACM3",
          "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB3"]
-BAUDRATE_APP = 115200
-BAUDRATE_BL = 460800
-BAUDRATES = [115200, 230400, 460800, 921600]
-debug_print = False
-chunk_size = 512
+BAUDRATE_APPLICATION = 115200
+BAUDRATE_BOOTLOADER = 460800
+chunk_size = 256
 kill_screen = True
+
+debug_print = False
+chaos_mode = False
 
 cwd = os.getcwd()
 FIRMWARE_FILE = cwd + "/" + sys.argv[1]  # Firmware file
 
+# TODO: Why is the script some times not reading messages at all?
 
-class State(enum.Enum):
-    HANDSHAKE = 1
-    SIZE = 2
-    FILE = 3
-    CRC = 4
-    FINISHED = 5
+# little-endian: seq (2 bytes), len (2 bytes), crc (4 bytes)
+PACKET_HEADER_FORMAT = "<HHI"
+PACKET_HEADER_SIZE = struct.calcsize(PACKET_HEADER_FORMAT)
+PACKET_DATA_SIZE = 256
+
+
+class Packet:
+    def __init__(self, seq, data: bytes):
+        self.seq = seq
+        self.len = len(data)
+        self.data = data
+        head = struct.pack("<HH", self.seq, self.len)
+        crc_input = head + data
+        pad_len = (4 - (len(crc_input) % 4)) % 4
+        padded = crc_input + b'\xFF' * pad_len
+        self.crc = zlib.crc32(padded) & 0xFFFFFFFF
+
+    def encode(self) -> bytes:
+        if chaos_mode:
+            data = maybe_corrupt(self.data)
+        else:
+            data = self.data
+        header = struct.pack(PACKET_HEADER_FORMAT,
+                             self.seq, self.len, self.crc)
+        return header + data
+
+    @classmethod
+    def decode(cls, raw: bytes):
+        if len(raw) < PACKET_HEADER_SIZE:
+            raise ValueError("Header mismatch")
+        seq, length, crc = struct.unpack(
+            PACKET_HEADER_FORMAT, raw[:PACKET_HEADER_SIZE])
+        data = raw[PACKET_HEADER_SIZE:PACKET_HEADER_SIZE + length]
+        if len(data) < length:
+            raise ValueError("Length mismatch")
+        crc_input = raw[0:2] + raw[2:4] + data
+        pad_len = (4 - (len(crc_input) % 4)) % 4
+        padded = crc_input + b'\xFF' * pad_len
+        if (zlib.crc32(padded) & 0xFFFFFFFF) != crc and seq != 0:
+            print(f"py:{zlib.crc32(padded) & 0xffffffff}, stm:{crc}")
+            raise ValueError("CRC mismatch")
+        return cls(seq, data)
+
+
+class BTP(asyncio.Protocol):
+    def __init__(self):
+        self.buffer = bytearray()
+        self.ser = None
+        self.seq = 0
+        self.firmware_data = read_binary()
+        self.firmware_size = len(self.firmware_data)
+        self.chunk_size = chunk_size
+        self.chunk_index = 0
+        self.start = time.perf_counter()
+
+    def connection_made(self, ser):
+        self.ser = ser
+
+    def data_received(self, data):
+        self.buffer.extend(data)
+        while len(self.buffer) >= PACKET_HEADER_SIZE:
+            # Peek header to check if we have enough for full message
+            seq, length, crc = struct.unpack(
+                PACKET_HEADER_FORMAT, self.buffer[:PACKET_HEADER_SIZE])
+            total_len = PACKET_HEADER_SIZE + length
+
+            if length > PACKET_DATA_SIZE:
+                self.buffer.clear()
+                continue
+
+            if len(self.buffer) < total_len:
+                return  # wait for more data
+
+            raw_packet = self.buffer[:total_len]
+            self.buffer = self.buffer[total_len:]
+
+            try:
+                packet = Packet.decode(raw_packet)
+                if debug_print:
+                    print(f"Received msg: seq={packet.seq}, len={
+                          packet.len}, data={packet.data}")
+                self.respond(packet)
+            except ValueError as e:
+                print(f"Error decoding message: {e}")
+
+    def respond(self, packet):
+
+        if packet.seq == 0:
+            print(packet.data.decode('ascii'), end="")
+
+        elif packet.seq == 1 and packet.data == b"update":
+            print("Connection established, sending handshake..")
+            self.send_packet(2, b"ACK")
+
+        elif packet.seq == 3 and packet.data == b"ACK":
+            print("Handshake completed, sending size..")
+            payload = struct.pack("<I", self.firmware_size)
+            self.send_packet(4, payload)
+
+        elif packet.seq == 5 and packet.data == b"ACK":
+            print("Size verified, sending binary..")
+            chunk = self.firmware_data[:min(self.firmware_size, chunk_size)]
+            self.send_packet(100, chunk)
+
+        elif 100 <= packet.seq <= (99 + int(self.firmware_size / chunk_size)) and packet.data == b"ACK":
+
+            offset = packet.seq - 99
+
+            remaining_bytes = self.firmware_size - offset
+
+            if remaining_bytes > 0:
+                chunk_size_to_send = min(chunk_size, remaining_bytes)
+                chunk = self.firmware_data[offset *
+                                           chunk_size:(offset * chunk_size) + chunk_size_to_send]
+
+                self.send_packet(packet.seq + 1, bytearray(chunk))
+                print(f"Sent {(packet.seq-99)*chunk_size + len(chunk)
+                              } / {len(self.firmware_data)
+                                   } bytes", end="\r")
+
+        elif packet.seq == (100 + int(self.firmware_size /
+                                      chunk_size)) and packet.data == b"ACK":
+            print("\nBinary verified, sending CRC..")
+            pad_len = (4 - (len(self.firmware_data) % 4)) % 4
+            padded = self.firmware_data + b'\xFF' * pad_len
+            payload = struct.pack("<I", zlib.crc32(padded) & 0xFFFFFFFF)
+            self.send_packet(65533, payload)
+
+        elif packet.seq == 65534 and packet.data == b"ACK":
+            print("CRC verified, rewriting flash..")
+
+        elif packet.seq == 65535 and packet.data == b"ACK":
+            print(f"Update took {
+                  time.perf_counter() - self.start:.2f} seconds")
+            exit(1)
+
+        else:
+            print("No match, ask for re-transfer")
+            print(str(packet.data))
+
+    def send_packet(self, seq, data: bytes):
+        packet = Packet(seq, data)
+        encoded = packet.encode()
+        if debug_print:
+            print(f"Sending: seq={packet.seq}, len={
+                  packet.len}, data={packet.data}")
+        self.ser.write(encoded)
+
+
+def maybe_corrupt(data):
+    if random.random() < 0.1:  # 10% chance to corrupt
+        data = bytearray(data)
+        data[random.randint(0, len(data)-1)] ^= 0xFF
+    return data
 
 
 def kill_screen_on_uart(port):
@@ -37,39 +189,6 @@ def kill_screen_on_uart(port):
     except subprocess.CalledProcessError:
         if debug_print:
             print(f"No screen session found on {port}")
-
-
-def read_message(ser, size, blocking=False):
-    try:
-        if blocking:
-            ser.timeout = None
-        else:
-            ser.timeout = 0.2
-        if size == 0:
-            response = ser.readline()
-        else:
-            response = ser.readline(size)
-        if response:
-            decoded = response.decode(errors="ignore").strip()
-            if debug_print:
-                print(f"\nSTM32: {decoded}\n")
-            return decoded
-    except serial.Timeout:
-        ser.timeout = 0.2
-        return None
-    ser.timeout = 0.2
-    return None
-
-
-def open_serial(port, baudrate=115200):
-
-    while True:
-        try:
-            with serial.Serial(port, baudrate) as ser:
-                return ser
-        except serial.SerialException as e:
-            print(e)
-            exit(1)
 
 
 def get_port():
@@ -129,110 +248,30 @@ def read_binary():
         sys.exit(1)
 
 
+async def main(port):
+
+    port = get_port()
+    loop = asyncio.get_running_loop()
+    await serial_asyncio.create_serial_connection(
+        loop, BTP, port, baudrate=BAUDRATE_BOOTLOADER
+    )
+    await asyncio.sleep(60)
+
+
 def send_firmware():
 
     port = get_port()
 
-    state = State.HANDSHAKE
-    firmware_data = read_binary()
+    with serial.Serial(port, BAUDRATE_APPLICATION) as ser:
+        ser.write(b"\rflash\r")
 
-    with open_serial(port, BAUDRATE_APP) as ser:
+    print()
+    print("///////////////////////////////////////////////////")
+    print(f"// Firmware file: {sys.argv[1]}")
+    print(f"// Firmware size: {len(read_binary())} bytes")
+    print("///////////////////////////////////////////////////\n")
 
-        # TODO: Test different baud rates here before sending flash command
-        # Maybe can just send the flash command with different bauds and
-        # see if one responds
-
-        # Sending a return to clear any commands not parsed by the application
-        ser.write(b"\r")
-        time.sleep(0.1)
-        ser.reset_input_buffer()
-        # Sends a flash command to the application,
-        # making it jump to bootloader
-        ser.write(b"flash\r")
-
-    # Attempting to flash
-    with open_serial(port, BAUDRATE_BL) as ser:
-        print()
-        print("///////////////////////////////////////////////////")
-        print(f"// Firmware file: {sys.argv[1]}")
-        print(f"// Firmware size: {len(firmware_data)} bytes")
-        print("///////////////////////////////////////////////////\n")
-        print("Restart device to initiate update")
-        print("Waiting for handshake..")
-        ser.timeout = 0.1
-
-        firmware_size_bytes = struct.pack(">I", len(firmware_data))
-
-        crc = zlib.crc32(firmware_data) & 0xFFFFFFFF
-        crc_bytes = struct.pack(">I", crc)
-
-        ser.reset_input_buffer()
-
-        while True:
-            time.sleep(0.1)
-            match state:
-                case State.HANDSHAKE:
-                    # TODO: Try to send "1234" with different baud rates
-                    # If response is also "1234" baud is matching, can proceed
-                    ser.write(b"U")
-                    ser.reset_input_buffer()
-                    msg = read_message(ser, 0)
-                    if msg and "ACK" in msg:
-                        ser.write(b"A")
-                        ser.reset_input_buffer()
-                        msg = read_message(ser, 3)
-                        if msg and "ACK" in msg:
-                            print("Handshake completed, sending size..")
-                            state = State.SIZE
-
-                case State.SIZE:
-                    ser.write(bytearray(firmware_size_bytes))
-                    ser.reset_input_buffer()
-                    msg = read_message(ser, len(str(len(firmware_data))))
-                    if msg and str(len(firmware_data)) in msg:
-                        state = State.FILE
-                    elif msg and "FTL" in msg:
-                        print("Firmware size too large, exiting.")
-                        return
-                    else:
-                        time.sleep(0.1)
-
-                # TODO: Require ACK for each chunk
-                # make it retry after a small delay
-                #
-                # bootloader also needs to reset if no data is received
-                # within an acceptable time frame
-
-                case State.FILE:
-                    for i in range(0, len(firmware_data), chunk_size):
-                        chunk = firmware_data[i: i + chunk_size]
-                        ser.write(bytearray(chunk))
-                        print(f"Sent {i + len(chunk)
-                                      } / {len(firmware_data)
-                                           } bytes", end="\r")
-                    msg = read_message(ser, 3)
-                    if msg and "ACK" in msg:
-                        print()
-                        print("Binary transfer completed!")
-                        state = State.CRC
-
-                case State.CRC:
-                    ser.write(bytearray(crc_bytes))
-                    msg = read_message(ser, len(bytearray(crc)))
-                    if msg and str(crc) in msg:
-                        print("CRC transfer completed!")
-                        state = State.FINISHED
-
-                case State.FINISHED:
-                    msg = read_message(ser, 0)
-                    if msg:
-                        if "ACK" in msg:
-                            break
-                        print(msg)
-
-        if debug_print:
-            while True:
-                msg = read_message(ser, 0)
+    asyncio.run(main(port))
 
 
 if __name__ == "__main__":
