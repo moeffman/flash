@@ -23,8 +23,6 @@ chaos_mode = False
 cwd = os.getcwd()
 FIRMWARE_FILE = cwd + "/" + sys.argv[1]  # Firmware file
 
-# TODO: Why is the script some times not reading messages at all?
-
 # little-endian: seq (2 bytes), len (2 bytes), crc (4 bytes)
 PACKET_HEADER_FORMAT = "<HHI"
 PACKET_HEADER_SIZE = struct.calcsize(PACKET_HEADER_FORMAT)
@@ -58,13 +56,14 @@ class Packet:
         seq, length, crc = struct.unpack(
             PACKET_HEADER_FORMAT, raw[:PACKET_HEADER_SIZE])
         data = raw[PACKET_HEADER_SIZE:PACKET_HEADER_SIZE + length]
+        if chaos_mode:
+            data = maybe_corrupt(data)
         if len(data) < length:
             raise ValueError("Length mismatch")
         crc_input = raw[0:2] + raw[2:4] + data
         pad_len = (4 - (len(crc_input) % 4)) % 4
         padded = crc_input + b'\xFF' * pad_len
         if (zlib.crc32(padded) & 0xFFFFFFFF) != crc and seq != 0:
-            print(f"py:{zlib.crc32(padded) & 0xffffffff}, stm:{crc}")
             raise ValueError("CRC mismatch")
         return cls(seq, data)
 
@@ -120,12 +119,12 @@ class BTP(asyncio.Protocol):
             self.send_packet(2, b"ACK")
 
         elif packet.seq == 3 and packet.data == b"ACK":
-            print("Handshake completed, sending size..")
+            print("Handshake completed, erasing old flash and sending size..")
             payload = struct.pack("<I", self.firmware_size)
             self.send_packet(4, payload)
 
         elif packet.seq == 5 and packet.data == b"ACK":
-            print("Size verified, sending binary..")
+            print("Size verified, writing firmware..")
             chunk = self.firmware_data[:min(self.firmware_size, chunk_size)]
             self.send_packet(100, chunk)
 
@@ -141,20 +140,17 @@ class BTP(asyncio.Protocol):
                                            chunk_size:(offset * chunk_size) + chunk_size_to_send]
 
                 self.send_packet(packet.seq + 1, bytearray(chunk))
-                print(f"Sent {(packet.seq-99)*chunk_size + len(chunk)
-                              } / {len(self.firmware_data)
-                                   } bytes", end="\r")
+                print(f"{(packet.seq-99)*chunk_size + len(chunk)
+                         } / {len(self.firmware_data)
+                              } bytes written..", end="\r")
 
         elif packet.seq == (100 + int(self.firmware_size /
                                       chunk_size)) and packet.data == b"ACK":
-            print("\nBinary verified, sending CRC..")
+            print("\nFlash successfully written!")
             pad_len = (4 - (len(self.firmware_data) % 4)) % 4
             padded = self.firmware_data + b'\xFF' * pad_len
             payload = struct.pack("<I", zlib.crc32(padded) & 0xFFFFFFFF)
-            self.send_packet(65533, payload)
-
-        elif packet.seq == 65534 and packet.data == b"ACK":
-            print("CRC verified, rewriting flash..")
+            self.send_packet(65534, payload)
 
         elif packet.seq == 65535 and packet.data == b"ACK":
             print(f"Update took {
